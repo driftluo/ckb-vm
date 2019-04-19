@@ -357,6 +357,7 @@ const TRACE_ADDRESS_SHIFTS: usize = 4;
 #[derive(Default)]
 struct Trace {
     address: usize,
+    length: usize,
     instructions: [Option<Instruction>; TRACE_ITEM_LENGTH],
 }
 
@@ -409,7 +410,7 @@ impl<'a, Inner: SupportMachine> DefaultMachine<'a, Inner> {
         while self.running() {
             let pc = self.pc().to_usize();
             let slot = (pc >> TRACE_ADDRESS_SHIFTS) & TRACE_MASK;
-            if pc != traces[slot].address {
+            if pc != traces[slot].address || traces[slot].length == 0 {
                 for i in 0..TRACE_ITEM_LENGTH {
                     traces[slot].instructions[i] = None;
                 }
@@ -426,6 +427,7 @@ impl<'a, Inner: SupportMachine> DefaultMachine<'a, Inner> {
                     i += 1;
                 }
                 traces[slot].address = pc;
+                traces[slot].length = i;
             }
             for i in &traces[slot].instructions {
                 match i {
