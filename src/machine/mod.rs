@@ -1,17 +1,20 @@
-use super::bits::rounddown;
+#[cfg(feature = "asm")]
+pub mod asm;
+pub mod trace;
+
+use super::bits::{rounddown, roundup};
 use super::decoder::build_imac_decoder;
-use super::instructions::{Instruction, Register};
-use super::memory::{Memory, PROT_EXEC, PROT_READ, PROT_WRITE};
+use super::instructions::{execute, Instruction, Register};
+use super::memory::{Memory, FLAG_EXECUTABLE, FLAG_FREEZED};
 use super::syscalls::Syscalls;
 use super::{
-    Error, A0, A7, DEFAULT_STACK_SIZE, REGISTER_ABI_NAMES, RISCV_GENERAL_REGISTER_NUMBER,
-    RISCV_MAX_MEMORY, RISCV_PAGESIZE, SP,
+    registers::{A0, A7, REGISTER_ABI_NAMES, SP},
+    Error, DEFAULT_STACK_SIZE, RISCV_GENERAL_REGISTER_NUMBER, RISCV_MAX_MEMORY, RISCV_PAGESIZE,
 };
+use bytes::Bytes;
 use goblin::elf::program_header::{PF_R, PF_W, PF_X, PT_LOAD};
 use goblin::elf::{Elf, Header};
-use std::cmp::max;
 use std::fmt::{self, Display};
-use std::rc::Rc;
 
 fn elf_bits(header: &Header) -> Option<usize> {
     // This is documented in ELF specification, we are exacting ELF file
@@ -26,18 +29,18 @@ fn elf_bits(header: &Header) -> Option<usize> {
 }
 
 // Converts goblin's ELF flags into RISC-V flags
-fn convert_flags(p_flags: u32) -> u32 {
-    let mut flags = 0;
-    if p_flags & PF_R != 0 {
-        flags |= PROT_READ;
+fn convert_flags(p_flags: u32) -> Result<u8, Error> {
+    let readable = p_flags & PF_R != 0;
+    let writable = p_flags & PF_W != 0;
+    let executable = p_flags & PF_X != 0;
+    if (!readable) || (writable && executable) {
+        return Err(Error::InvalidPermission);
     }
-    if p_flags & PF_W != 0 {
-        flags |= PROT_WRITE;
+    if executable {
+        Ok(FLAG_EXECUTABLE | FLAG_FREEZED)
+    } else {
+        Ok(FLAG_FREEZED)
     }
-    if p_flags & PF_X != 0 {
-        flags |= PROT_EXEC;
-    }
-    flags
 }
 
 /// This is the core part of RISC-V that only deals with data part, it
@@ -66,9 +69,6 @@ pub trait Machine: CoreMachine {
 /// such as ELF range, cycles which might be needed on Rust side of the logic,
 /// such as runner or syscall implementations.
 pub trait SupportMachine: CoreMachine {
-    // End address of elf segment
-    fn elf_end(&self) -> usize;
-    fn set_elf_end(&mut self, elf_end: usize);
     // Current execution cycles, it's up to the actual implementation to
     // call add_cycles for each instruction/operation to provide cycles.
     // The implementation might also choose not to do this to ignore this
@@ -91,27 +91,29 @@ pub trait SupportMachine: CoreMachine {
         Ok(())
     }
 
-    fn load_elf(&mut self, program: &[u8]) -> Result<(), Error> {
+    fn load_elf(&mut self, program: &Bytes) -> Result<(), Error> {
         let elf = Elf::parse(program).map_err(|_e| Error::ParseError)?;
         let bits = elf_bits(&elf.header).ok_or(Error::InvalidElfBits)?;
         if bits != Self::REG::BITS {
             return Err(Error::InvalidElfBits);
         }
-        let program_slice = Rc::new(program.to_vec().into_boxed_slice());
         for program_header in &elf.program_headers {
             if program_header.p_type == PT_LOAD {
                 let aligned_start = rounddown(program_header.p_vaddr as usize, RISCV_PAGESIZE);
                 let padding_start = program_header.p_vaddr as usize - aligned_start;
-                // Like a normal mmap, we will align size to pages internally
-                let size = program_header.p_filesz as usize + padding_start;
-                let current_elf_end = self.elf_end();
-                self.set_elf_end(max(aligned_start + size, current_elf_end));
-                self.memory_mut().mmap(
+                let size = roundup(
+                    program_header.p_memsz as usize + padding_start,
+                    RISCV_PAGESIZE,
+                );
+                self.memory_mut().init_pages(
                     aligned_start,
                     size,
-                    convert_flags(program_header.p_flags),
-                    Some(Rc::clone(&program_slice)),
-                    program_header.p_offset as usize - padding_start,
+                    convert_flags(program_header.p_flags)?,
+                    Some(program.slice(
+                        program_header.p_offset as usize,
+                        (program_header.p_offset + program_header.p_filesz) as usize,
+                    )),
+                    padding_start,
                 )?;
                 self.memory_mut()
                     .store_byte(aligned_start, padding_start, 0)?;
@@ -123,24 +125,23 @@ pub trait SupportMachine: CoreMachine {
 
     fn initialize_stack(
         &mut self,
-        args: &[Vec<u8>],
+        args: &[Bytes],
         stack_start: usize,
         stack_size: usize,
     ) -> Result<(), Error> {
-        self.memory_mut()
-            .mmap(stack_start, stack_size, PROT_READ | PROT_WRITE, None, 0)?;
+        // We are enforcing WXorX now, there's no need to call init_pages here
+        // since all the required bits are already set.
         self.set_register(SP, Self::REG::from_usize(stack_start + stack_size));
         // First value in this array is argc, then it contains the address(pointer)
         // of each argv object.
         let mut values = vec![Self::REG::from_usize(args.len())];
         for arg in args {
-            let bytes = arg.as_slice();
-            let len = Self::REG::from_usize(bytes.len() + 1);
+            let len = Self::REG::from_usize(arg.len() + 1);
             let address = self.registers()[SP].overflowing_sub(&len);
 
-            self.memory_mut().store_bytes(address.to_usize(), bytes)?;
+            self.memory_mut().store_bytes(address.to_usize(), arg)?;
             self.memory_mut()
-                .store_byte(address.to_usize() + bytes.len(), 1, 0)?;
+                .store_byte(address.to_usize() + arg.len(), 1, 0)?;
 
             values.push(address.clone());
             self.set_register(SP, address);
@@ -156,7 +157,6 @@ pub trait SupportMachine: CoreMachine {
         }
         if self.registers()[SP].to_usize() < stack_start {
             // args exceed stack size
-            self.memory_mut().munmap(stack_start, stack_size)?;
             return Err(Error::OutOfBound);
         }
         Ok(())
@@ -168,7 +168,6 @@ pub struct DefaultCoreMachine<R, M> {
     registers: [R; RISCV_GENERAL_REGISTER_NUMBER],
     pc: R,
     memory: M,
-    elf_end: usize,
     cycles: u64,
     max_cycles: Option<u64>,
 }
@@ -202,14 +201,6 @@ impl<R: Register, M: Memory<R>> CoreMachine for DefaultCoreMachine<R, M> {
 }
 
 impl<R: Register, M: Memory<R>> SupportMachine for DefaultCoreMachine<R, M> {
-    fn elf_end(&self) -> usize {
-        self.elf_end
-    }
-
-    fn set_elf_end(&mut self, elf_end: usize) {
-        self.elf_end = elf_end;
-    }
-
     fn cycles(&self) -> u64 {
         self.cycles
     }
@@ -223,7 +214,7 @@ impl<R: Register, M: Memory<R>> SupportMachine for DefaultCoreMachine<R, M> {
     }
 }
 
-impl<R: Register, M: Memory<R>> DefaultCoreMachine<R, M> {
+impl<R: Register, M: Memory<R> + Default> DefaultCoreMachine<R, M> {
     pub fn new_with_max_cycles(max_cycles: u64) -> Self {
         Self {
             max_cycles: Some(max_cycles),
@@ -232,7 +223,7 @@ impl<R: Register, M: Memory<R>> DefaultCoreMachine<R, M> {
     }
 }
 
-pub type InstructionCycleFunc = Fn(&Instruction) -> u64;
+pub type InstructionCycleFunc = Fn(Instruction) -> u64;
 
 #[derive(Default)]
 pub struct DefaultMachine<'a, Inner> {
@@ -245,7 +236,7 @@ pub struct DefaultMachine<'a, Inner> {
     instruction_cycle_func: Option<Box<InstructionCycleFunc>>,
     syscalls: Vec<Box<dyn Syscalls<Inner> + 'a>>,
     running: bool,
-    exit_code: u8,
+    exit_code: i8,
 }
 
 impl<Inner: CoreMachine> CoreMachine for DefaultMachine<'_, Inner> {
@@ -278,14 +269,6 @@ impl<Inner: CoreMachine> CoreMachine for DefaultMachine<'_, Inner> {
 }
 
 impl<Inner: SupportMachine> SupportMachine for DefaultMachine<'_, Inner> {
-    fn elf_end(&self) -> usize {
-        self.inner.elf_end()
-    }
-
-    fn set_elf_end(&mut self, elf_end: usize) {
-        self.inner.set_elf_end(elf_end)
-    }
-
     fn cycles(&self) -> u64 {
         self.inner.cycles()
     }
@@ -305,7 +288,7 @@ impl<Inner: SupportMachine> Machine for DefaultMachine<'_, Inner> {
         match code {
             93 => {
                 // exit
-                self.exit_code = self.registers()[A0].to_u8();
+                self.exit_code = self.registers()[A0].to_i8();
                 self.running = false;
                 Ok(())
             }
@@ -343,7 +326,7 @@ impl<Inner: CoreMachine> Display for DefaultMachine<'_, Inner> {
 }
 
 impl<'a, Inner: SupportMachine> DefaultMachine<'a, Inner> {
-    pub fn load_program(mut self, program: &[u8], args: &[Vec<u8>]) -> Result<Self, Error> {
+    pub fn load_program(&mut self, program: &Bytes, args: &[Bytes]) -> Result<(), Error> {
         self.load_elf(program)?;
         for syscall in &mut self.syscalls {
             syscall.initialize(&mut self.inner)?;
@@ -353,7 +336,7 @@ impl<'a, Inner: SupportMachine> DefaultMachine<'a, Inner> {
             RISCV_MAX_MEMORY - DEFAULT_STACK_SIZE,
             DEFAULT_STACK_SIZE,
         )?;
-        Ok(self)
+        Ok(())
     }
 
     pub fn take_inner(self) -> Inner {
@@ -368,7 +351,7 @@ impl<'a, Inner: SupportMachine> DefaultMachine<'a, Inner> {
         self.running = running;
     }
 
-    pub fn exit_code(&self) -> u8 {
+    pub fn exit_code(&self) -> i8 {
         self.exit_code
     }
 
@@ -380,7 +363,11 @@ impl<'a, Inner: SupportMachine> DefaultMachine<'a, Inner> {
         &mut self.inner
     }
 
-    pub fn interpret(&mut self) -> Result<u8, Error> {
+    // This is the most naive way of running the VM, it only decodes each
+    // instruction and run it, no optimization is performed here. It might
+    // not be practical in production, but it serves as a baseline and
+    // reference implementation
+    pub fn run(&mut self) -> Result<i8, Error> {
         let decoder = build_imac_decoder::<Inner::REG>();
         self.set_running(true);
         while self.running() {
@@ -389,11 +376,11 @@ impl<'a, Inner: SupportMachine> DefaultMachine<'a, Inner> {
                 let memory = self.memory_mut();
                 decoder.decode(memory, pc)?
             };
-            instruction.execute(self)?;
+            execute(instruction, self)?;
             let cycles = self
                 .instruction_cycle_func()
                 .as_ref()
-                .map(|f| f(&instruction))
+                .map(|f| f(instruction))
                 .unwrap_or(0);
             self.add_cycles(cycles)?;
         }

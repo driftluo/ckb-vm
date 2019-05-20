@@ -1,14 +1,11 @@
-use super::{
-    emitter::Emitter,
-    instructions::{instruction_length, is_basic_block_end_instruction, is_jitable_instruction},
-    tracer::Tracer,
-    value::Value,
-};
+use super::{emitter::Emitter, instructions::is_jitable_instruction, tracer::Tracer, value::Value};
 use crate::{
-    decoder::build_imac_decoder, CoreMachine, DefaultMachineBuilder, Error, InstructionCycleFunc,
-    Machine, Memory, Register, SparseMemory, SupportMachine, Syscalls,
-    RISCV_GENERAL_REGISTER_NUMBER,
+    decoder::build_imac_decoder,
+    instructions::{execute, instruction_length, is_basic_block_end_instruction},
+    CoreMachine, DefaultMachineBuilder, Error, InstructionCycleFunc, Machine, Memory, Register,
+    SparseMemory, SupportMachine, Syscalls,
 };
+use bytes::Bytes;
 use fnv::FnvHashMap;
 use libc::{c_int, uint64_t};
 use memmap::{Mmap, MmapMut};
@@ -35,7 +32,6 @@ struct AsmData {
 
 impl AsmData {
     fn new(rust_data: &RustData) -> Self {
-        debug_assert!(RISCV_GENERAL_REGISTER_NUMBER == 32);
         AsmData {
             registers: [0; ASM_DATA_REGISTERS_SLOTS],
             rust_data: ptr::NonNull::from(rust_data),
@@ -49,7 +45,6 @@ impl AsmData {
 struct RustData {
     // Machine related data, should be cleared before each run
     memory: SparseMemory<u64>,
-    elf_end: usize,
     cycles: u64,
     max_cycles: Option<u64>,
 
@@ -77,7 +72,6 @@ impl RustData {
     fn new(tracer: Box<Tracer>) -> Self {
         Self {
             memory: SparseMemory::default(),
-            elf_end: 0,
             cycles: 0,
             max_cycles: None,
             buffer: None,
@@ -118,13 +112,13 @@ impl RustData {
 }
 
 #[derive(Default)]
-pub struct BaselineJitRunData<'a, 'b> {
+pub struct BaselineJitRunData<'b> {
     max_cycles: Option<u64>,
     instruction_cycle_func: Option<Box<InstructionCycleFunc>>,
-    syscalls: Vec<Box<dyn Syscalls<BaselineJitMachine<'a>> + 'b>>,
+    syscalls: Vec<Box<dyn Syscalls<BaselineJitMachine> + 'b>>,
 }
 
-impl<'a, 'b> BaselineJitRunData<'a, 'b> {
+impl<'b> BaselineJitRunData<'b> {
     pub fn max_cycles(mut self, max_cycles: u64) -> Self {
         self.max_cycles = Some(max_cycles);
         self
@@ -138,7 +132,7 @@ impl<'a, 'b> BaselineJitRunData<'a, 'b> {
         self
     }
 
-    pub fn syscall(mut self, syscall: Box<dyn Syscalls<BaselineJitMachine<'a>> + 'b>) -> Self {
+    pub fn syscall(mut self, syscall: Box<dyn Syscalls<BaselineJitMachine> + 'b>) -> Self {
         self.syscalls.push(syscall);
         self
     }
@@ -163,17 +157,17 @@ impl<'a, 'b> BaselineJitRunData<'a, 'b> {
 /// the above baseline JIT, this path still has many uncertainties which is more
 /// likely to change. Also this will has much lower priority if baseline JIT
 /// is proved to be enough for CKB use.
-pub struct BaselineJitMachine<'a> {
+pub struct BaselineJitMachine {
     asm_data: AsmData,
     rust_data: Pin<Box<RustData>>,
     // In fact program should not belong here, however we are putting it here
     // so as to shape the API in a way that one instance here only works on
     // one program
-    program: &'a [u8],
+    program: Bytes,
 }
 
-impl<'a> BaselineJitMachine<'a> {
-    pub fn new(program: &'a [u8], tracer: Box<Tracer>) -> Self {
+impl BaselineJitMachine {
+    pub fn new(program: Bytes, tracer: Box<Tracer>) -> Self {
         let rust_data = Box::pin(RustData::new(tracer));
         let asm_data = AsmData::new(rust_data.as_ref().get_ref());
 
@@ -184,18 +178,18 @@ impl<'a> BaselineJitMachine<'a> {
         }
     }
 
-    pub fn run(self, args: &[Vec<u8>]) -> Result<(u8, Self), Error> {
+    pub fn run(self, args: &[Bytes]) -> Result<(i8, Self), Error> {
         self.run_with_data(args, BaselineJitRunData::default())
     }
 
     pub fn run_with_data<'b>(
         mut self,
-        args: &[Vec<u8>],
-        data: BaselineJitRunData<'a, 'b>,
-    ) -> Result<(u8, Self), Error> {
+        args: &[Bytes],
+        data: BaselineJitRunData<'b>,
+    ) -> Result<(i8, Self), Error> {
         self.reset();
         self.rust_data.max_cycles = data.max_cycles;
-        let program = self.program;
+        let program = self.program.clone();
         let mut builder = DefaultMachineBuilder::<Self>::new(self);
         if let Some(instruction_cycle_func) = data.instruction_cycle_func {
             builder = builder.instruction_cycle_func(instruction_cycle_func);
@@ -203,7 +197,8 @@ impl<'a> BaselineJitMachine<'a> {
         for syscall in data.syscalls {
             builder = builder.syscall(syscall);
         }
-        let mut machine = builder.build().load_program(program, args)?;
+        let mut machine = builder.build();
+        machine.load_program(&program, args)?;
         let mut emitter = Emitter::new()?;
         let decoder = build_imac_decoder::<u64>();
         machine.set_running(true);
@@ -240,17 +235,17 @@ impl<'a> BaselineJitMachine<'a> {
             let mut instructions = Vec::new();
             loop {
                 let instruction = decoder.decode(machine.memory_mut(), current_pc)?;
-                let jitable = is_jitable_instruction(&instruction);
-                let end_instruction = (!jitable) || is_basic_block_end_instruction(&instruction);
+                let jitable = is_jitable_instruction(instruction);
+                let end_instruction = (!jitable) || is_basic_block_end_instruction(instruction);
                 // Unjitable instruction will be its own basic block
                 if instructions.is_empty() || jitable {
-                    let length = instruction_length(&instruction);
+                    let length = instruction_length(instruction);
                     current_pc += length;
                     block_length += length;
                     block_cycles += machine
                         .instruction_cycle_func()
                         .as_ref()
-                        .map(|f| f(&instruction))
+                        .map(|f| f(instruction))
                         .unwrap_or(0);
                     instructions.push(instruction);
                 }
@@ -260,7 +255,7 @@ impl<'a> BaselineJitMachine<'a> {
                 }
             }
             for i in &instructions {
-                i.execute(&mut machine)?;
+                execute(*i, &mut machine)?;
             }
             machine.add_cycles(block_cycles)?;
             let rust_data = &mut machine.inner_mut().rust_data;
@@ -272,7 +267,7 @@ impl<'a> BaselineJitMachine<'a> {
                 // current basic block is hot, JIT it.
                 let mut compiling_machine = JitCompilingMachine::new(pc);
                 for i in &instructions {
-                    i.execute(&mut compiling_machine)?;
+                    execute(*i, &mut compiling_machine)?;
                 }
                 emitter.setup()?;
                 for write in compiling_machine.writes() {
@@ -311,7 +306,6 @@ impl<'a> BaselineJitMachine<'a> {
     fn reset(&mut self) {
         self.asm_data.registers = [0; ASM_DATA_REGISTERS_SLOTS];
         self.rust_data.memory = SparseMemory::<u64>::default();
-        self.rust_data.elf_end = 0;
         self.rust_data.cycles = 0;
         self.rust_data.max_cycles = None;
     }
@@ -321,7 +315,7 @@ impl<'a> BaselineJitMachine<'a> {
     }
 }
 
-impl<'a> CoreMachine for BaselineJitMachine<'a> {
+impl CoreMachine for BaselineJitMachine {
     type REG = u64;
     type MEM = SparseMemory<u64>;
 
@@ -350,15 +344,7 @@ impl<'a> CoreMachine for BaselineJitMachine<'a> {
     }
 }
 
-impl<'a> SupportMachine for BaselineJitMachine<'a> {
-    fn elf_end(&self) -> usize {
-        self.rust_data.elf_end
-    }
-
-    fn set_elf_end(&mut self, elf_end: usize) {
-        self.rust_data.elf_end = elf_end;
-    }
-
+impl SupportMachine for BaselineJitMachine {
     fn cycles(&self) -> u64 {
         self.rust_data.cycles
     }
@@ -403,7 +389,6 @@ struct JitCompilingMachine {
 
 impl JitCompilingMachine {
     fn new(pc: usize) -> Self {
-        debug_assert!(RISCV_GENERAL_REGISTER_NUMBER == 32);
         let registers = [
             Value::Register(0),
             Value::Register(1),
@@ -521,18 +506,18 @@ impl Machine for JitCompilingMachine {
 }
 
 impl Memory<Value> for JitCompilingMachine {
-    fn mmap(
+    fn init_pages(
         &mut self,
         _addr: usize,
         _size: usize,
-        _prot: u32,
-        _source: Option<Rc<Box<[u8]>>>,
-        _offset: usize,
+        _flags: u8,
+        _source: Option<Bytes>,
+        _offset_from_addr: usize,
     ) -> Result<(), Error> {
         Err(Error::Unimplemented)
     }
 
-    fn munmap(&mut self, _addr: usize, _size: usize) -> Result<(), Error> {
+    fn fetch_flag(&mut self, _page: usize) -> Result<u8, Error> {
         Err(Error::Unimplemented)
     }
 
@@ -727,5 +712,15 @@ extern "C" fn ckb_vm_jit_ffi_load64(
             0
         }
         None => -1,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::RISCV_GENERAL_REGISTER_NUMBER;
+
+    #[test]
+    fn test_jit_constant_rules() {
+        assert!(RISCV_GENERAL_REGISTER_NUMBER == 32);
     }
 }
